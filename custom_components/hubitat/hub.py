@@ -9,10 +9,8 @@ from typing import TYPE_CHECKING, Any, Callable, TypeVar, cast, override
 from custom_components.hubitat.hubitatmaker.const import DeviceAttribute
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    ATTR_HIDDEN,
     CONF_ACCESS_TOKEN,
     CONF_HOST,
-    CONF_ID,
     CONF_TEMPERATURE_UNIT,
     UnitOfTemperature,
 )
@@ -22,7 +20,7 @@ from homeassistant.helpers.device_registry import DeviceEntry
 
 try:
     from homeassistant.helpers.discovery_flow import (
-        DiscoveryKey,  # pyright: ignore[reportAssignmentType]
+        DiscoveryKey,
     )
 except Exception:
 
@@ -46,6 +44,7 @@ from .const import (
     PLATFORMS,
     TEMP_F,
     TRIGGER_CAPABILITIES,
+    Platform,
 )
 from .hubitatmaker import (
     Device,
@@ -64,6 +63,7 @@ from .util import (
 _LOGGER = getLogger(__name__)
 
 Listener = Callable[[Event], None]
+ConnectionListener = Callable[[bool], None]
 
 HUB_DEVICE_NAME = "Hub"
 HUB_NAME = "Hubitat Elevation"
@@ -93,8 +93,9 @@ class Hub(HasId):
     _device_listeners: dict[str, list[Listener]]
     _hub: HubitatHub
     _is_connected: bool
+    _connection_listeners: list[ConnectionListener]
     _retry_task_unsub: CALLBACK_TYPE | None
-    _platforms_setup: bool
+    _setup_platforms: set[Platform]
 
     def __init__(
         self,
@@ -136,8 +137,9 @@ class Hub(HasId):
         self._hub = hub
         self.device = device
         self._is_connected = False
+        self._connection_listeners = []
         self._retry_task_unsub = None
-        self._platforms_setup = False
+        self._setup_platforms = set()
 
     @property
     def app_id(self) -> str:
@@ -253,9 +255,43 @@ class Hub(HasId):
         """Add entities to this hub."""
         self.entities.extend(entities)
 
+    def add_connection_listener(self, listener: ConnectionListener) -> None:
+        """Add a listener for hub connection status changes."""
+        self._connection_listeners.append(listener)
+
+    def remove_connection_listener(self, listener: ConnectionListener) -> None:
+        """Remove a connection status listener."""
+        if listener in self._connection_listeners:
+            self._connection_listeners.remove(listener)
+
+    def set_connected(self, connected: bool) -> None:
+        """Set the connection status and notify listeners on change."""
+        if self._is_connected == connected:
+            return
+
+        self._is_connected = connected
+        for listener in self._connection_listeners.copy():
+            try:
+                listener(connected)
+            except Exception:
+                _LOGGER.exception(
+                    "Error notifying connection listener for hub %s",
+                    self.id,
+                )
+
     def add_event_emitters(self, emitters: list[M]) -> None:
         """Add event emitters to this hub."""
         self.event_emitters.extend(emitters)
+
+    def mark_platforms_setup(self, platforms: tuple[Platform, ...]) -> None:
+        """Record that the listed platforms have been set up."""
+        self._setup_platforms.update(platforms)
+
+    def get_unsetup_platforms(
+        self, platforms: tuple[Platform, ...] = PLATFORMS
+    ) -> tuple[Platform, ...]:
+        """Return platforms that have not been set up yet."""
+        return tuple(p for p in platforms if p not in self._setup_platforms)
 
     def remove_device_listeners(self, device_id: str) -> None:
         """Remove all listeners for a specific device."""
@@ -283,6 +319,7 @@ class Hub(HasId):
         """Stop the hub."""
         if self._hub:
             self._hub.stop()
+        self.set_connected(False)
         self._device_listeners = {}
         self._hub_device_listeners = []
 
@@ -304,16 +341,6 @@ class Hub(HasId):
 
         # Cancel retry task if it's still running
         self.cancel_retry_task()
-
-    def get_state_attributes(self) -> dict[str, Any]:
-        """Get the state attributes for the hub entity."""
-        attrs = {
-            CONF_ID: f"{self._hub.host}::{self._hub.app_id}",
-            CONF_HOST: self.host,
-            ATTR_HIDDEN: True,
-            CONF_TEMPERATURE_UNIT: self.temperature_unit,
-        }
-        return attrs
 
     @staticmethod
     async def create(hass: HomeAssistant, entry: ConfigEntry, index: int) -> "Hub":
@@ -383,11 +410,15 @@ class Hub(HasId):
 
         # setup proxy Device representing the hub that can be used for linked
         # entities
+        hub_device_id = cast(str | None, entry.data.get(H_CONF_HUB_ID))
+        if hub_device_id is None:
+            hub_device_id = get_hub_short_id(hubitat_hub)
         device = Device(
             {
-                "id": get_hub_short_id(hubitat_hub),
+                "id": hub_device_id,
                 "name": HUB_DEVICE_NAME,
                 "label": HUB_DEVICE_NAME,
+                "type": HUB_DEVICE_NAME,
                 "model": "Cx",
                 "manufacturer": HUB_NAME,
                 "attributes": [
@@ -408,7 +439,7 @@ class Hub(HasId):
         )
 
         hub = Hub(hass, entry, index, hubitat_hub, device)
-        hub._is_connected = True
+        hub.set_connected(True)
         domain_data = get_domain_data(hass)
         domain_data[entry.entry_id] = hub
 
@@ -429,6 +460,7 @@ class Hub(HasId):
 
         # Initialize entities
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        hub.mark_platforms_setup(PLATFORMS)
 
         _LOGGER.debug("Registered platforms")
 
@@ -438,13 +470,6 @@ class Hub(HasId):
         )
         if should_update_rooms:
             _update_device_rooms(hub, hass)
-
-        # Create an entity for the Hubitat hub with basic hub information
-        hass.states.async_set(
-            hub.entity_id,
-            "connected",
-            hub.get_state_attributes(),
-        )
 
         if hub.mode_supported:
 
@@ -538,11 +563,15 @@ class Hub(HasId):
         )
 
         # Create a placeholder device for the hub
+        hub_device_id = cast(str | None, entry.data.get(H_CONF_HUB_ID))
+        if hub_device_id is None:
+            hub_device_id = get_hub_short_id(hubitat_hub)
         device = Device(
             {
-                "id": "unknown",
+                "id": hub_device_id,
                 "name": HUB_DEVICE_NAME,
                 "label": HUB_DEVICE_NAME,
+                "type": HUB_DEVICE_NAME,
                 "model": "Cx",
                 "manufacturer": HUB_NAME,
                 "attributes": [],
@@ -552,16 +581,9 @@ class Hub(HasId):
         )
 
         hub = Hub(hass, entry, index, hubitat_hub, device)
-        hub._is_connected = False
+        hub.set_connected(False)
         domain_data = get_domain_data(hass)
         domain_data[entry.entry_id] = hub
-
-        # Create an entity for the Hubitat hub in unavailable state
-        hass.states.async_set(
-            hub.entity_id,
-            "unavailable",
-            hub.get_state_attributes(),
-        )
 
         return hub
 
@@ -587,9 +609,10 @@ class Hub(HasId):
             # Update the device with hub info
             self.device = Device(
                 {
-                    "id": get_hub_short_id(self._hub),
+                    "id": self.id,
                     "name": HUB_DEVICE_NAME,
                     "label": HUB_DEVICE_NAME,
+                    "type": HUB_DEVICE_NAME,
                     "model": "Cx",
                     "manufacturer": HUB_NAME,
                     "attributes": [
@@ -620,12 +643,13 @@ class Hub(HasId):
             # Migrate entity unique IDs from old token-hash format to new hub-id format
             _migrate_entity_unique_ids(self.hass, self.id, self.token)
 
-            # Initialize entities (only once - this is not idempotent)
-            if not self._platforms_setup:
+            # Initialize entities only for platforms that are not set up yet.
+            platforms_to_setup = self.get_unsetup_platforms()
+            if len(platforms_to_setup) > 0:
                 await self.hass.config_entries.async_forward_entry_setups(
-                    self.config_entry, PLATFORMS
+                    self.config_entry, platforms_to_setup
                 )
-                self._platforms_setup = True
+                self.mark_platforms_setup(platforms_to_setup)
 
             _LOGGER.debug("Registered platforms")
 
@@ -666,7 +690,7 @@ class Hub(HasId):
                         DeviceAttribute.HSM_STATUS, self.hsm_status, None
                     )
 
-            self._is_connected = True
+            self.set_connected(True)
             _LOGGER.debug("Hub connection complete")
 
         except Exception:
@@ -681,6 +705,7 @@ class Hub(HasId):
             # Clear mode and HSM listeners
             self._hub.remove_mode_listeners()
             self._hub.remove_hsm_status_listeners()
+            self.set_connected(False)
 
             raise
 
@@ -770,12 +795,6 @@ class Hub(HasId):
             for entity in hub.entities:
                 entity.load_state()
             _LOGGER.debug("Set temperature units to %s", temp_unit)
-
-        hass.states.async_set(
-            hub.entity_id,
-            "connected",
-            {CONF_HOST: hub.host, CONF_TEMPERATURE_UNIT: hub.temperature_unit},
-        )
 
     async def check_config(self) -> None:
         """Verify that the hub is accessible."""
@@ -1050,8 +1069,8 @@ if TYPE_CHECKING:
         title="Hubitat",
         data={},
         source="",
-        minor_version=0,  # type: ignore
-        discovery_keys=test_discovery_keys,  # pyright: ignore[reportArgumentType]
+        minor_version=0,
+        discovery_keys=test_discovery_keys,
         options=None,
         unique_id=None,
         subentries_data=None,

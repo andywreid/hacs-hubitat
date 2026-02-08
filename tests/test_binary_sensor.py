@@ -1,6 +1,8 @@
 # pyright: reportAny=false, reportPrivateUsage=false
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+
+import pytest
 
 from custom_components.hubitat.binary_sensor import (
     HubitatAccelerationSensor,
@@ -8,6 +10,7 @@ from custom_components.hubitat.binary_sensor import (
     HubitatContactSensor,
     HubitatCoSensor,
     HubitatHeatSensor,
+    HubitatHubConnectionBinarySensor,
     HubitatMoistureSensor,
     HubitatMotionSensor,
     HubitatNaturalGasSensor,
@@ -18,6 +21,7 @@ from custom_components.hubitat.binary_sensor import (
     HubitatSoundSensor,
     HubitatTamperSensor,
     HubitatValveSensor,
+    async_setup_entry,
 )
 from custom_components.hubitat.hubitatmaker.const import DeviceAttribute
 from custom_components.hubitat.hubitatmaker.types import Attribute
@@ -124,6 +128,99 @@ def test_binary_sensor_device_attrs():
     )
 
     assert sensor.device_attrs == (DeviceAttribute.MOTION,)
+
+
+def test_hub_connection_binary_sensor_has_unique_id():
+    """Test that hub connection sensor has a stable unique ID."""
+    hub = Mock()
+    hub.configure_mock(
+        id="hub12345",
+        is_connected=True,
+        host="192.168.1.10",
+        app_id="123",
+        temperature_unit="F",
+        add_device_listener=Mock(),
+        add_connection_listener=Mock(),
+    )
+
+    device = Mock()
+    device.configure_mock(
+        id="hub12345",
+        name="Hub",
+        label="Hub",
+        attributes={},
+    )
+
+    sensor = HubitatHubConnectionBinarySensor(hub=hub, device=device)
+
+    assert sensor.unique_id == "hub12345::binary_sensor::hub_status"
+    assert sensor.name == "Hub Status"
+    assert sensor.is_on is True
+    assert sensor.device_class == BinarySensorDeviceClass.CONNECTIVITY
+    hub.add_device_listener.assert_not_called()
+    assert sensor.extra_state_attributes == {
+        "id": "192.168.1.10::123",
+        "host": "192.168.1.10",
+        "hidden": True,
+        "temperature_unit": "F",
+        "connection_state": "connected",
+    }
+
+
+def test_hub_connection_binary_sensor_disconnected_state_attribute():
+    """Disconnected hub status should use a non-HA-state string."""
+    hub = Mock()
+    hub.configure_mock(
+        id="hub12345",
+        is_connected=False,
+        host="192.168.1.10",
+        app_id="123",
+        temperature_unit="F",
+        add_device_listener=Mock(),
+        add_connection_listener=Mock(),
+    )
+
+    device = Mock()
+    device.configure_mock(id="hub12345", name="Hub", label="Hub", attributes={})
+
+    sensor = HubitatHubConnectionBinarySensor(hub=hub, device=device)
+    assert sensor.extra_state_attributes is not None
+    assert sensor.extra_state_attributes["connection_state"] == "disconnected"
+
+
+def test_hub_status_del_safe_when_uninitialized():
+    """__del__ should be safe for partially initialized entities."""
+    sensor = HubitatHubConnectionBinarySensor.__new__(HubitatHubConnectionBinarySensor)
+    # __del__ is called explicitly to ensure the cleanup path is exercised in
+    # the test
+    sensor.__del__()
+
+
+@pytest.mark.asyncio
+async def test_binary_sensor_setup_offline_adds_connection_listener():
+    """When hub starts offline, binary sensor setup listens for reconnect."""
+    hub = Mock()
+    hub.configure_mock(
+        id="hub12345",
+        is_connected=False,
+        host="192.168.1.10",
+        app_id="123",
+        temperature_unit="F",
+        device=Mock(id="hub12345", name="Hub", label="Hub", attributes={}),
+        devices={},
+        add_device_listener=Mock(),
+        add_connection_listener=Mock(),
+        add_entities=Mock(),
+    )
+
+    hass = Mock()
+    config_entry = Mock(entry_id="entry")
+    async_add_entities = Mock()
+
+    with patch("custom_components.hubitat.binary_sensor.get_hub", return_value=hub):
+        await async_setup_entry(hass, config_entry, async_add_entities)
+
+    hub.add_connection_listener.assert_called_once()
 
 
 def test_acceleration_sensor():
